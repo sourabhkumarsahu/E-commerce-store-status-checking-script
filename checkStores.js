@@ -3,7 +3,7 @@ const csv = require('csv-parser');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const path = require('path');
-const {promisify} = require('util');
+const { promisify } = require('util');
 const writeFile = promisify(fs.writeFile);
 
 // File paths
@@ -32,42 +32,42 @@ async function axiosRetry(url, options, retries = 2, backoff = 3000) {
 
 async function isShopifyStore(url) {
     try {
-        const response = await axiosRetry(url, {timeout: 15000});
+        const response = await axiosRetry(url, { timeout: 15000 });
         const html = response.data;
 
         if (url.includes('.myshopify.com') || url.includes('shopify.com')) {
-            return {isShopify: true, isPasswordProtected: false};
+            return { isShopify: true, isPasswordProtected: false };
         }
 
         const poweredByHeader = response.headers['powered-by'];
         if (poweredByHeader && poweredByHeader.includes('Shopify')) {
-            return {isShopify: true, isPasswordProtected: false};
+            return { isShopify: true, isPasswordProtected: false };
         }
 
         const $ = cheerio.load(html);
         const isShopifyMeta = $('meta[name="shopify-checkout-api-token"]').length > 0;
         const hasShopifyScripts = $('script[src*="shopify"]').length > 0;
 
-        return {isShopify: isShopifyMeta || hasShopifyScripts, isPasswordProtected: false};
+        return { isShopify: isShopifyMeta || hasShopifyScripts, isPasswordProtected: false };
     } catch (error) {
         if (error.response) {
             const poweredByHeader = error.response.headers['powered-by'];
             if (poweredByHeader && poweredByHeader.includes('Shopify')) {
-                return {isShopify: true, isPasswordProtected: false};
+                return { isShopify: true, isPasswordProtected: false };
             }
             if (error.response.status === 404) {
                 console.error(`URL not found: ${url}`);
-                return {isShopify: false, isPasswordProtected: false};
+                return { isShopify: false, isPasswordProtected: false };
             }
         }
         console.error(`Error checking if URL is Shopify store ${url}:`, error.message);
-        return {isShopify: false, isPasswordProtected: false};
+        return { isShopify: false, isPasswordProtected: false };
     }
 }
 
 async function checkURL(url) {
     try {
-        const response = await axiosRetry(url, {timeout: 15000});
+        const response = await axiosRetry(url, { timeout: 15000 });
         return response.status === 200;
     } catch (error) {
         if (error.response) {
@@ -125,14 +125,13 @@ async function checkPasswordProtection(url) {
     }
 }
 
-
 async function processURL(url) {
     // Ensure the URL has a protocol
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
         url = 'http://' + url;
     }
 
-    const {isShopify} = await isShopifyStore(url);
+    const { isShopify } = await isShopifyStore(url);
     let isPasswordProtected = false;
     let isActive = false;
 
@@ -143,57 +142,70 @@ async function processURL(url) {
         }
     }
 
-    return {isShopify, isActive, isPasswordProtected};
+    return { isShopify, isActive, isPasswordProtected };
 }
 
 async function processCSV() {
+    const pLimit = (await import('p-limit')).default;
     console.time('Processing Time');
     const startTime = Date.now();
     const results = [];
     const readStream = fs.createReadStream(inputFile).pipe(csv());
 
-    const concurrencyLimit = 10; // Number of concurrent requests
-    const batch = [];
+    const concurrencyLimit = 20; // Increase the concurrency limit
+    const limit = pLimit(concurrencyLimit);
+    const extraColumns = new Set();
 
     for await (const data of readStream) {
-        const url = data.URL;
-        const clientId = data.ClientId;
-        batch.push({url, clientId});
+        const url = data['Website URL'];
+        const recordId = data['Record ID'];
+        extraColumns.add(...Object.keys(data).filter(key => key !== 'Website URL' && key !== 'Record ID'));
 
-        if (batch.length >= concurrencyLimit) {
-            const batchResults = await Promise.all(batch.map(({url, clientId}) => processURL(url).then(result => ({
-                clientId,
-                url, ...result
-            }))));
-            results.push(...batchResults);
-            batch.length = 0; // Clear the batch
-        }
-    }
-
-    if (batch.length > 0) {
-        const batchResults = await Promise.all(batch.map(({url, clientId}) => processURL(url).then(result => ({
-            clientId,
-            url, ...result
+        results.push(limit(() => processURL(url).then(result => ({
+            recordId,
+            url,
+            ...result,
+            ...data
         }))));
-        results.push(...batchResults);
     }
 
-    await writeCSV(results, startTime);
+    const finalResults = await Promise.all(results);
+    await writeCSV(finalResults, startTime, Array.from(extraColumns));
     const endTime = Date.now();
     console.timeEnd('Processing Time');
     console.log(`Start Time: ${new Date(startTime).toLocaleString()}`);
     console.log(`End Time: ${new Date(endTime).toLocaleString()}`);
 }
 
-async function writeCSV(data, startTime) {
-    const headers = ['ClientId', 'URL', 'isShopify', 'isActive', 'isPasswordProtected'];
+async function writeCSV(data, startTime, extraColumns) {
+    const expectedColumns = {
+        'Create Date': '',
+        'Number of Associated Contacts': '',
+        'City': '',
+        'Country/Region': '',
+        'Last Activity Date': '',
+        'Company owner': ''
+    };
+
+    const headers = ['Record ID', 'Website URL', 'isShopify', 'isActive', 'isPasswordProtected', ...Object.keys(expectedColumns), ...extraColumns];
     const rows = data.map(row => {
-        const clientId = row.ClientId || row.clientId;
-        const url = row.URL || row.url;
-        return `${clientId},${url},${row.isShopify},${row.isActive},${row.isPasswordProtected}`;
+        const recordId = row['Record ID'] || row.recordId;
+        const url = row['Website URL'] || row.url;
+        const extraData = extraColumns.map(col => row[col] || '').join(',');
+        const expectedData = Object.keys(expectedColumns).map(col => row[col] || expectedColumns[col]).join(',');
+        return `${recordId},${url},${row.isShopify},${row.isActive},${row.isPasswordProtected},${expectedData},${extraData}`;
     }).join('\n');
-    console.log(rows)
     const csvContent = [headers.join(','), rows].join('\n');
+
+    // Read the extra rows from the input file
+    const extraRows = [];
+    const readStream = fs.createReadStream(inputFile).pipe(csv());
+    for await (const data of readStream) {
+        if (!data['Website URL'] || !data['Record ID']) {
+            extraRows.push(Object.values(data).join(','));
+        }
+    }
+
     // Calculate metrics
     const totalStores = data.length;
     const shopifyStores = data.filter(row => row.isShopify).length;
@@ -216,10 +228,10 @@ async function writeCSV(data, startTime) {
         `Processing Time: ${processingTime} seconds`
     ].join('\n');
 
-    const finalContent = [csvContent, metrics].join('\n\n');
+    const finalContent = [csvContent, ...extraRows, metrics].join('\n\n');
 
     await writeFile(outputFile, finalContent);
-    console.log('CSV file updated successfully with metrics!');
+    console.log('CSV file updated successfully with metrics and extra rows!');
 }
 
 processCSV().catch(error => console.error('Error processing CSV:', error));
